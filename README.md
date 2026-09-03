@@ -1,490 +1,567 @@
-# RideSync A1 — Database Setup & Execution Guide
+# RideSync A1 - Database Implementation
 
-This repository contains the PostgreSQL and MongoDB implementation for the RideSync A1 assignment.
+## 1. PostgreSQL Schema
 
-Run commands from the repository root.
+**File:** `01_schema_ddl.sql`
+
+This script creates the PostgreSQL database schema required for the RideSync application.
+
+### Main Tables
+
+- `riders` — stores rider information and wallet balances.
+- `vehicles` — stores vehicle information such as UUID and license plate.
+- `trips` — stores ride information, including rider, vehicle, fare, status, and timestamps.
+- `wallet_audit_logs` — stores audit records for wallet balance changes.
+
+### Key Features
+
+- UUID-based primary keys.
+- Foreign-key relationships between riders, vehicles, and trips.
+- Appropriate data types and constraints.
+- Constraints for validating wallet balances, fares, and trip states.
 
 ---
 
-# 1. Clone Repository
+## 2. PostgreSQL Indexing
 
+**File:** `02_indexes.sql`
+
+This script creates indexes for query performance and business-rule enforcement.
+
+### Active Rider Partial Unique Index
+
+The partial unique index on `trips(rider_id)` prevents a rider from having more than one active trip at the same time.
+
+The active trip statuses are:
+
+- `REQUESTED`
+- `IN_TRANSIT`
+
+### Secondary Indexes
+
+Indexes are created for commonly queried columns, including:
+
+- `trips.rider_id`
+- `trips.vehicle_id`
+- `trips.created_at`
+- completed trips based on trip status
+- vehicle-related lookup columns
+- rider-related lookup columns
+
+### Completed Trips Partial Index
+
+A partial index is created for completed trips.
+
+It is restricted to rows where:
+
+`status = 'COMPLETED'`
+
+This is intended to improve queries that specifically filter for completed trips.
+
+---
+
+## 3. PostgreSQL Trigger and Audit Logging
+
+**File:** `03_triggers_and_audit.sql`
+
+This script implements automatic auditing of rider wallet balance changes.
+
+### Trigger
+
+The trigger `trg_wallet_audit` fires after an update to the `wallet_balance` column of the `riders` table.
+
+It only fires when the wallet balance actually changes.
+
+### Audit Logic
+
+The wallet balance change is calculated as:
+
+`NEW.wallet_balance - OLD.wallet_balance`
+
+The action is classified as:
+
+- `TOP_UP` — when the wallet balance increases.
+- `FARE_DEDUCTION` — when the wallet balance decreases.
+
+The following information is stored in `wallet_audit_logs`:
+
+- Rider UUID
+- Amount changed
+- Action type
+- Balance after the transaction
+- Timestamp
+
+If the wallet balance does not change, no audit record is generated.
+
+### Verification
+
+The trigger was tested by performing wallet balance changes and checking the corresponding records in `wallet_audit_logs`.
+
+This confirms that wallet changes are automatically recorded by PostgreSQL.
+
+---
+
+## 4. Atomic Booking — Stored Procedure
+
+**File:** `04_stored_procedures.sql`
+
+This script implements ride booking using the PostgreSQL stored procedure `sp_book_ride`.
+
+### Procedure Parameters
+
+The procedure accepts:
+
+- Rider UUID
+- Vehicle UUID
+- Fare amount
+
+### Workflow
+
+The procedure performs the following operations:
+
+1. Locks the rider row using `FOR UPDATE`.
+2. Checks whether the rider exists.
+3. Checks whether the rider has sufficient wallet balance.
+4. Checks whether the selected vehicle is active.
+5. Deducts the fare from the rider's wallet.
+6. Inserts a new trip with status `REQUESTED`.
+7. Commits the transaction after successful booking.
+
+### Atomicity
+
+The wallet deduction and trip creation are performed within the same transaction.
+
+The procedure therefore ensures that the booking operation is completed as a single database transaction.
+
+### Verification
+
+The procedure was tested using valid rider and vehicle UUIDs.
+
+The resulting wallet balance and trip records were verified in PostgreSQL.
+
+The active-rider partial unique index also prevents a rider from creating another active trip while an existing trip is in `REQUESTED` or `IN_TRANSIT` status.
+
+---
+
+## 5. Materialized View
+
+**File:** `05_materialized_views.sql`
+
+This script creates the materialized view `mv_vehicle_stats`.
+
+### Purpose
+
+The materialized view provides precomputed vehicle-level statistics to make repeated analytical reads faster.
+
+### Statistics Stored
+
+The view contains:
+
+- Vehicle UUID
+- License plate
+- Total number of trips
+- Total earnings from completed trips
+
+### Unique Index
+
+A unique index is created on `vehicle_id`.
+
+This provides the uniqueness requirement needed for concurrent materialized-view refreshes.
+
+### Refresh Function
+
+A PostgreSQL function is provided to refresh the materialized view.
+
+The refresh function can be called using:
+
+`SELECT refresh_mv_vehicle_stats();`
+
+### Verification
+
+The materialized-view statistics were compared against values calculated directly from the `trips` table.
+
+The counts and earnings were verified against the underlying trip data.
+
+---
+
+## 6. SQL Window Analytics
+
+**File:** `06_window_analytics.sql`
+
+This script performs trend analysis and vehicle performance ranking using Common Table Expressions and SQL window functions.
+
+### Step 1 — Daily Revenue
+
+The `daily_revenue` CTE calculates the total fare revenue for each vehicle for each day.
+
+Only trips with status `COMPLETED` are included.
+
+### Step 2 — Seven-Day Moving Average
+
+The `moving_metrics` CTE calculates a seven-day moving average for each vehicle.
+
+The window is partitioned by `vehicle_id`, ordered by `trip_date`, and considers the current row and the previous six rows.
+
+### Step 3 — Vehicle Ranking
+
+The final query uses `DENSE_RANK()` to rank vehicles for each day according to their seven-day moving average.
+
+### Output
+
+The final result contains:
+
+- Vehicle license plate
+- Trip date
+- Daily fare
+- Seven-day moving average
+- Vehicle rank for that day
+
+The query was successfully executed on the populated database.
+
+---
+
+## 7. Performance Proof
+
+PostgreSQL performance testing was performed using:
+
+`EXPLAIN (ANALYZE, BUFFERS)`
+
+The raw PostgreSQL execution plans are stored in:
+
+`performance/postgres_explain_analyzes.txt`
+
+### Workflow 2 — SQL Window Analytics
+
+The Workflow 2 query processes approximately 100,001 rows from the `trips` table.
+
+The execution plan contains a sequential scan on `trips`.
+
+The filter is:
+
+`status = 'COMPLETED'`
+
+Only 2 rows were removed by this filter, meaning almost all rows in the table were completed trips.
+
+Because the filter is not selective, PostgreSQL determined that scanning the table sequentially was cheaper than using the completed-trip partial index.
+
+The partial index `idx_trips_status_completed` exists and can be used for completed-trip queries.
+
+A diagnostic execution with sequential scans disabled confirmed that PostgreSQL can use the index.
+
+Therefore, the sequential scan in the original execution plan is a cost-based optimizer decision rather than a missing-index problem.
+
+### Workflow 2 Execution Statistics
+
+- Rows processed: 100,001
+- Rows returned: 1,400
+- Rows removed by filter: 2
+- Planning Time: 2.204 ms
+- Execution Time: 108.391 ms
+
+The complete `EXPLAIN (ANALYZE, BUFFERS)` output is included in `performance/postgres_explain_analyzes.txt`.
+
+---
+
+## 8. SQL File Structure
+
+The SQL directory contains the following files:
+
+```text
+sql/
+├── 01_schema_ddl.sql
+├── 02_indexes.sql
+├── 03_triggers_and_audit.sql
+├── 04_stored_procedures.sql
+├── 05_materialized_views.sql
+└── 06_window_analytics.sql
+```
+
+# RideSync A2 — MongoDB Setup & Execution
+ 
+Run all commands from the repository root.
+ 
+---
+ 
+## 1. Clone Repository
+ 
 ```bash
 cd ~/Desktop/gitAsgn
 git clone https://github.com/dudekulamahammad/2026202016_a1.git
 cd 2026202016_a1
 ```
-
+ 
 Check files:
-
+ 
 ```bash
 find . -maxdepth 2 -type f | sort
 ```
-
+ 
 ---
-
-# 2. PostgreSQL Setup
-
-## 2.1 Create PostgreSQL Database
-
-Create the database:
-
-```bash
-createdb ridesync_db
-```
-
-If the database already exists, continue to the next step.
-
----
-
-## 2.2 Create Schema
-
-Run the schema DDL:
-
-```bash
-psql -d ridesync_db -f sql/01_schema_ddl.sql
-```
-
-Creates the main RideSync tables, keys, and constraints.
-
----
-
-## 2.3 Create Indexes
-
-```bash
-psql -d ridesync_db -f sql/02_indexes.sql
-```
-
-Creates partial and secondary indexes.
-
----
-
-## 2.4 Create Triggers and Audit
-
-```bash
-psql -d ridesync_db -f sql/03_triggers_and_audit.sql
-```
-
-Creates wallet audit triggers.
-
----
-
-## 2.5 Create Stored Procedures
-
-```bash
-psql -d ridesync_db -f sql/04_stored_procedures.sql
-```
-
-Creates the atomic ride-booking procedure.
-
----
-
-## 2.6 Create Materialized Views
-
-```bash
-psql -d ridesync_db -f sql/05_materialized_views.sql
-```
-
-Creates vehicle statistics materialized views.
-
----
-
-## 2.7 Run Window Analytics
-
-```bash
-psql -d ridesync_db -f sql/06_window_analytics.sql
-```
-
-Runs the Workflow 2 window-function analysis.
-
----
-
-## 2.8 Generate PostgreSQL Data
-
-Install the required Python package:
-
-```bash
-python3 -m pip install psycopg2-binary
-```
-
-Run the PostgreSQL seeder:
-
-```bash
-python3 data_generations/postgres_seeder.py
-```
-
-This generates the required mock PostgreSQL data.
-
----
-
-# 3. MongoDB Setup
-
-## 3.1 Start MongoDB
-
+ 
+## 2. Start MongoDB
+ 
 ```bash
 sudo systemctl start mongod
 ```
-
+ 
 Check MongoDB:
-
+ 
 ```bash
 mongosh --eval 'db.runCommand({ ping: 1 })'
 ```
-
+ 
 ---
-
-## 3.2 Install PyMongo
-
+ 
+## 3. Install PyMongo
+ 
 ```bash
 python3 -m pip install pymongo
 ```
-
+ 
 ---
-
-## 3.3 Generate MongoDB Data
-
+ 
+## 4. Generate MongoDB Data
+ 
 ```bash
 python3 data_generations/mongo_seeder.py
 ```
-
-Generates:
-
+ 
+Creates:
+ 
 * `VehicleMetadata` — 150 documents
 * `TripReviews` — 100,000 documents
 * `TelemetryPings` — 500,000 documents
-
-Verify counts:
-
+ 
+Verify:
+ 
 ```bash
 mongosh --quiet --eval 'const db=db.getSiblingDB("ridesync_db"); print("VehicleMetadata:",db.VehicleMetadata.countDocuments()); print("TripReviews:",db.TripReviews.countDocuments()); print("TelemetryPings:",db.TelemetryPings.countDocuments());'
 ```
-
+ 
 ---
-
-# 4. MongoDB Indexes
-
-Create indexes:
-
+ 
+## 5. Create Indexes
+ 
 ```bash
 mongosh --quiet --file mongo/01_collections_and_indexes.js
 ```
-
+ 
 Creates:
-
+ 
 * `location_2dsphere`
 * `createdAt_1` TTL index
 * `rating_1`
 * `vehicleId_1`
-
+ 
 Verify:
-
+ 
 ```bash
 mongosh --quiet --eval 'const db=db.getSiblingDB("ridesync_db"); printjson(db.TelemetryPings.getIndexes()); printjson(db.TripReviews.getIndexes());'
 ```
-
+ 
 ---
-
-# 5. MongoDB Workflow 3 — $geoNear
-
-Run:
-
+ 
+## 6. Run Workflow 3 — $geoNear
+ 
 ```bash
 mongosh --quiet --file mongo/02_workflow3_geonear.js
 ```
-
-Runs the nearest available vehicle search within 5 km using the `2dsphere` index.
-
+ 
+Runs the nearest available vehicle search within 5 km.
+ 
 ---
-
-# 6. MongoDB Workflow 4 — $facet
-
-Run:
-
+ 
+## 7. Run Workflow 4 — $facet
+ 
 ```bash
 mongosh --quiet --file mongo/03_workflow4_facet.js
 ```
-
+ 
 Runs:
-
+ 
 * Rating distribution
 * Top feedback tags
 * Average rating
-
+ 
 ---
-
-# 7. MongoDB EXPLAIN Statistics
-
-Generate performance evidence:
-
+ 
+## 8. Generate EXPLAIN Statistics
+ 
 ```bash
 python3 data_generations/generate_mongo_stats.py
 ```
-
-Creates/updates:
-
+ 
+Generates:
+ 
 ```text
 performance/mongo_execution_stats.json
 performance/mongo_explain_raw.json
 ```
-
-View the summary:
-
+ 
+View summary:
+ 
 ```bash
 cat performance/mongo_execution_stats.json
 ```
-
-View the raw explain output:
-
-```bash
-less performance/mongo_explain_raw.json
-```
-
-Press `q` to exit.
-
+ 
 ---
-
-# 8. Complete MongoDB Report
-
-Run:
-
+ 
+## 9. Run Complete MongoDB Report
+ 
 ```bash
 mongosh --quiet --file mongo/run_all_mongo_workflows.js
 ```
-
-This displays:
-
-* Collection counts
+ 
+This is the **main MongoDB demo command**.
+ 
+It shows:
+ 
+* Database/collection counts
 * Indexes
 * Workflow 3 results
-* Workflow 3 execution statistics
+* Workflow 3 EXPLAIN statistics
 * Workflow 4 rating distribution
 * Top feedback tags
 * Average rating
-* Workflow 4 execution statistics
-
+* Workflow 4 EXPLAIN statistics
+ 
 ---
-
-# 9. PostgreSQL Performance Evidence
-
-The PostgreSQL execution plans are stored in:
-
-```text
-performance/postgres_explain_analyzes.txt
-```
-
-View them:
-
-```bash
-cat performance/postgres_explain_analyzes.txt
-```
-
-The file contains `EXPLAIN (ANALYZE, BUFFERS)` output for the PostgreSQL workflow.
-
----
-
-# 10. MongoDB Performance Files
-
-Check:
-
+ 
+## 10. View Performance Files
+ 
 ```bash
 ls -lh performance/
 ```
-
-MongoDB evidence files:
-
-```text
-mongo_execution_stats.json
-mongo_explain_raw.json
-workflow3_explain_executionStats.log
-workflow4_explain_executionStats.log
-```
-
----
-
-# 11. Remove Python Cache Files
-
-Before committing, remove Python cache files:
-
-```bash
-find . -name "__pycache__" -type d -prune -exec rm -rf {} +
-```
-
-```bash
-find . -name "*.pyc" -delete
-```
-
-Verify:
-
-```bash
-find . -name "__pycache__" -o -name "*.pyc"
-```
-
-There should be no output.
-
----
-
-# 12. Repository Structure
-
-```text
-2026202016_a1/
-│
-├── README.md
-│
-├── docs/
-│   ├── relational_erd.png
-│   └── mongo_schema_map.json
-│
-├── sql/
-│   ├── 01_schema_ddl.sql
-│   ├── 02_indexes.sql
-│   ├── 03_triggers_and_audit.sql
-│   ├── 04_stored_procedures.sql
-│   ├── 05_materialized_views.sql
-│   └── 06_window_analytics.sql
-│
-├── mongo/
-│   ├── 01_collections_and_indexes.js
-│   ├── 02_workflow3_geonear.js
-│   ├── 03_workflow4_facet.js
-│   └── run_all_mongo_workflows.js
-│
-├── data_generations/
-│   ├── postgres_seeder.py
-│   ├── mongo_seeder.py
-│   ├── generate_mongo_stats.py
-│   ├── generate_trip_reviews.py
-│   └── get_geo_summary.py
-│
-└── performance/
-    ├── postgres_explain_analyzes.txt
-    ├── mongo_execution_stats.json
-    ├── mongo_explain_raw.json
-    ├── workflow3_explain_executionStats.log
-    └── workflow4_explain_executionStats.log
-```
-
----
-
-# 13. GitHub
-
-Check repository status:
-
-```bash
-git status
-```
-
-Add files:
-
-```bash
-git add .
-```
-
-Commit:
-
-```bash
-git commit -m "Add RideSync database assignment implementation"
-```
-
-Push:
-
-```bash
-git push origin master
-```
-
-If the repository uses `main`:
-
-```bash
-git push origin main
-```
-
----
-
-# 14. Quick MongoDB Demo
-
-From the repository root:
-
-```bash
-sudo systemctl start mongod
-```
-
-```bash
-python3 data_generations/mongo_seeder.py
-```
-
-```bash
-mongosh --quiet --file mongo/01_collections_and_indexes.js
-```
-
-```bash
-mongosh --quiet --file mongo/run_all_mongo_workflows.js
-```
-
-```bash
-python3 data_generations/generate_mongo_stats.py
-```
-
+ 
+View MongoDB execution summary:
+ 
 ```bash
 cat performance/mongo_execution_stats.json
 ```
-
+ 
+View raw EXPLAIN:
+ 
+```bash
+less performance/mongo_explain_raw.json
+```
+ 
+Press `q` to exit.
+ 
 ---
-
-# 15. Quick PostgreSQL Demo
-
-From the repository root:
-
+ 
+## 11. Remove Python Cache Before Git
+ 
 ```bash
-createdb ridesync_db
+find . -name "__pycache__" -type d -prune -exec rm -rf {} +
 ```
-
+ 
 ```bash
-psql -d ridesync_db -f sql/01_schema_ddl.sql
+find . -name "*.pyc" -delete
 ```
-
-```bash
-psql -d ridesync_db -f sql/02_indexes.sql
-```
-
-```bash
-psql -d ridesync_db -f sql/03_triggers_and_audit.sql
-```
-
-```bash
-psql -d ridesync_db -f sql/04_stored_procedures.sql
-```
-
-```bash
-psql -d ridesync_db -f sql/05_materialized_views.sql
-```
-
-```bash
-psql -d ridesync_db -f sql/06_window_analytics.sql
-```
-
-```bash
-python3 data_generations/postgres_seeder.py
-```
-
+ 
 ---
-
-# 16. Important Submission Note
-
-The database data itself is **not stored in GitHub**.
-
-Only the following are submitted:
-
-* SQL scripts
-* MongoDB scripts
-* Python data-generation scripts
-* Schema diagrams/maps
-* Performance/explain evidence
-* README documentation
-
-Do **not** commit:
-
-* MongoDB database dumps
-* PostgreSQL data dumps
-* CSV exports
-* `__pycache__`
-* `.pyc` files
-* Python virtual environments
-* Raw database files
+ 
+## 12. Check Git
+ 
+```bash
+git status
+```
+ 
+Add files:
+ 
+```bash
+git add .
+```
+ 
+Commit:
+ 
+```bash
+git commit -m "Add RideSync database assignment implementation"
+```
+ 
+Push:
+ 
+```bash
+git push origin master
+```
+ 
+If your branch is `main`:
+ 
+```bash
+git push origin main
+```
+ 
+---
+ 
+# Quick Demo
+ 
+If everything is already installed, run these from the repository root:
+ 
+```bash
+sudo systemctl start mongod
+```
+ 
+```bash
+python3 data_generations/mongo_seeder.py
+```
+ 
+```bash
+mongosh --quiet --file mongo/01_collections_and_indexes.js
+```
+ 
+```bash
+mongosh --quiet --file mongo/run_all_mongo_workflows.js
+```
+ 
+```bash
+python3 data_generations/generate_mongo_stats.py
+```
+ 
+```bash
+cat performance/mongo_execution_stats.json
+```
+ 
+---
+ 
+# Repository Structure
+ 
+```text
+docs/
+mongo/
+data_generations/
+performance/
+sql/
+README.md
+```
+ 
+MongoDB scripts:
+ 
+```text
+mongo/
+├── 01_collections_and_indexes.js
+├── 02_workflow3_geonear.js
+├── 03_workflow4_facet.js
+└── run_all_mongo_workflows.js
+```
+ 
+Data generation:
+ 
+```text
+data_generations/
+├── mongo_seeder.py
+├── generate_mongo_stats.py
+├── generate_trip_reviews.py
+└── get_geo_summary.py
+```
+ 
+Performance evidence:
+ 
+```text
+performance/
+├── mongo_execution_stats.json
+├── mongo_explain_raw.json
+├── workflow3_explain_executionStats.log
+└── workflow4_explain_executionStats.log
+```
+ 
+**MongoDB data is generated locally. No database dump or raw data is stored in GitHub.**
