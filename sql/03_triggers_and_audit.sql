@@ -50,5 +50,3 @@ AFTER UPDATE OF wallet_balance ON riders
 FOR EACH ROW
 WHEN (OLD.wallet_balance IS DISTINCT FROM NEW.wallet_balance)
 EXECUTE FUNCTION fn_audit_wallet_change();
-
-s
