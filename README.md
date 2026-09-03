@@ -1,4 +1,4 @@
-**GitHub Repository:** GitHub - dudekulamahammad/2026202016_a1: RideSync – Global Ride-Hailing Network
+**GitHub Repository:** GitHub - https://github.com/dudekulamahammad/2026202016_a1
 # RideSync A1 - Database Implementation
 
 ## 1. PostgreSQL Schema
