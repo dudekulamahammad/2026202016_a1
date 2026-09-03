@@ -1,0 +1,55 @@
+{
+  "database": "ridesync_db",
+  "collections": {
+    "VehicleMetadata": {
+      "purpose": "Flexible vehicle inspection, features, maintenance and insurance metadata",
+      "fields": {
+        "_id": "ObjectId",
+        "vehicleId": "String",
+        "licensePlate": "String",
+        "class": "String",
+        "features": "Array or Object",
+        "inspection": "Object",
+        "maintenance": "Object",
+        "insurance": "Object",
+        "updatedAt": "Date"
+      }
+    },
+
+    "TripReviews": {
+      "purpose": "Rider reviews and driver feedback",
+      "fields": {
+        "_id": "ObjectId",
+        "vehicleId": "String",
+        "rating": "Number (1-5)",
+        "feedback_tags": "Array of Strings",
+        "driver_feedback": "String",
+        "createdAt": "Date"
+      },
+      "indexes": [
+        "_id_",
+        "rating_1",
+        "vehicleId_1"
+      ]
+    },
+
+    "TelemetryPings": {
+      "purpose": "High-volume real-time vehicle location telemetry",
+      "fields": {
+        "_id": "ObjectId",
+        "vehicleId": "String",
+        "location": {
+          "type": "GeoJSON Point",
+          "coordinates": "[longitude, latitude]"
+        },
+        "isAvailable": "Boolean",
+        "createdAt": "Date"
+      },
+      "indexes": [
+        "_id_",
+        "location_2dsphere",
+        "createdAt_1 TTL 7200 seconds"
+      ]
+    }
+  }
+}
