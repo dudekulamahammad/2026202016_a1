@@ -1,10 +1,6 @@
--- =============================================================================
--- 06_WINDOW_ANALYTICS.SQL
--- Purpose: Trend analysis and performance ranking using Window Functions.
--- =============================================================================
 
 WITH daily_revenue AS (
-    -- Aggregate daily revenue per vehicle
+
     SELECT 
         vehicle_id,
         date_trunc('day', created_at) AS trip_date,
@@ -14,7 +10,7 @@ WITH daily_revenue AS (
     GROUP BY vehicle_id, date_trunc('day', created_at)
 ),
 moving_metrics AS (
-    -- Calculate 7-day moving average of fare revenue per vehicle
+
     SELECT 
         vehicle_id,
         trip_date,
@@ -26,7 +22,7 @@ moving_metrics AS (
         ) AS seven_day_moving_avg
     FROM daily_revenue
 )
--- Final Ranking using DENSE_RANK
+
 SELECT 
     v.license_plate,
     m.trip_date,
