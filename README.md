@@ -1,3 +1,281 @@
+# RideSync Database Implementation
+
+## 1. PostgreSQL Schema
+
+**File:** `01_schema_ddl.sql`
+
+This script creates the PostgreSQL database schema required for the RideSync application.
+
+### Main Tables
+
+- `riders` — stores rider information and wallet balances.
+- `vehicles` — stores vehicle information such as UUID and license plate.
+- `trips` — stores ride information, including rider, vehicle, fare, status, and timestamps.
+- `wallet_audit_logs` — stores audit records for wallet balance changes.
+
+### Key Features
+
+- UUID-based primary keys.
+- Foreign-key relationships between riders, vehicles, and trips.
+- Appropriate data types and constraints.
+- Constraints for validating wallet balances, fares, and trip states.
+
+---
+
+## 2. PostgreSQL Indexing
+
+**File:** `02_indexes.sql`
+
+This script creates indexes for query performance and business-rule enforcement.
+
+### Active Rider Partial Unique Index
+
+The partial unique index on `trips(rider_id)` prevents a rider from having more than one active trip at the same time.
+
+The active trip statuses are:
+
+- `REQUESTED`
+- `IN_TRANSIT`
+
+### Secondary Indexes
+
+Indexes are created for commonly queried columns, including:
+
+- `trips.rider_id`
+- `trips.vehicle_id`
+- `trips.created_at`
+- completed trips based on trip status
+- vehicle-related lookup columns
+- rider-related lookup columns
+
+### Completed Trips Partial Index
+
+A partial index is created for completed trips.
+
+It is restricted to rows where:
+
+`status = 'COMPLETED'`
+
+This is intended to improve queries that specifically filter for completed trips.
+
+---
+
+## 3. PostgreSQL Trigger and Audit Logging
+
+**File:** `03_triggers_and_audit.sql`
+
+This script implements automatic auditing of rider wallet balance changes.
+
+### Trigger
+
+The trigger `trg_wallet_audit` fires after an update to the `wallet_balance` column of the `riders` table.
+
+It only fires when the wallet balance actually changes.
+
+### Audit Logic
+
+The wallet balance change is calculated as:
+
+`NEW.wallet_balance - OLD.wallet_balance`
+
+The action is classified as:
+
+- `TOP_UP` — when the wallet balance increases.
+- `FARE_DEDUCTION` — when the wallet balance decreases.
+
+The following information is stored in `wallet_audit_logs`:
+
+- Rider UUID
+- Amount changed
+- Action type
+- Balance after the transaction
+- Timestamp
+
+If the wallet balance does not change, no audit record is generated.
+
+### Verification
+
+The trigger was tested by performing wallet balance changes and checking the corresponding records in `wallet_audit_logs`.
+
+This confirms that wallet changes are automatically recorded by PostgreSQL.
+
+---
+
+## 4. Atomic Booking — Stored Procedure
+
+**File:** `04_stored_procedures.sql`
+
+This script implements ride booking using the PostgreSQL stored procedure `sp_book_ride`.
+
+### Procedure Parameters
+
+The procedure accepts:
+
+- Rider UUID
+- Vehicle UUID
+- Fare amount
+
+### Workflow
+
+The procedure performs the following operations:
+
+1. Locks the rider row using `FOR UPDATE`.
+2. Checks whether the rider exists.
+3. Checks whether the rider has sufficient wallet balance.
+4. Checks whether the selected vehicle is active.
+5. Deducts the fare from the rider's wallet.
+6. Inserts a new trip with status `REQUESTED`.
+7. Commits the transaction after successful booking.
+
+### Atomicity
+
+The wallet deduction and trip creation are performed within the same transaction.
+
+The procedure therefore ensures that the booking operation is completed as a single database transaction.
+
+### Verification
+
+The procedure was tested using valid rider and vehicle UUIDs.
+
+The resulting wallet balance and trip records were verified in PostgreSQL.
+
+The active-rider partial unique index also prevents a rider from creating another active trip while an existing trip is in `REQUESTED` or `IN_TRANSIT` status.
+
+---
+
+## 5. Materialized View
+
+**File:** `05_materialized_views.sql`
+
+This script creates the materialized view `mv_vehicle_stats`.
+
+### Purpose
+
+The materialized view provides precomputed vehicle-level statistics to make repeated analytical reads faster.
+
+### Statistics Stored
+
+The view contains:
+
+- Vehicle UUID
+- License plate
+- Total number of trips
+- Total earnings from completed trips
+
+### Unique Index
+
+A unique index is created on `vehicle_id`.
+
+This provides the uniqueness requirement needed for concurrent materialized-view refreshes.
+
+### Refresh Function
+
+A PostgreSQL function is provided to refresh the materialized view.
+
+The refresh function can be called using:
+
+`SELECT refresh_mv_vehicle_stats();`
+
+### Verification
+
+The materialized-view statistics were compared against values calculated directly from the `trips` table.
+
+The counts and earnings were verified against the underlying trip data.
+
+---
+
+## 6. SQL Window Analytics
+
+**File:** `06_window_analytics.sql`
+
+This script performs trend analysis and vehicle performance ranking using Common Table Expressions and SQL window functions.
+
+### Step 1 — Daily Revenue
+
+The `daily_revenue` CTE calculates the total fare revenue for each vehicle for each day.
+
+Only trips with status `COMPLETED` are included.
+
+### Step 2 — Seven-Day Moving Average
+
+The `moving_metrics` CTE calculates a seven-day moving average for each vehicle.
+
+The window is partitioned by `vehicle_id`, ordered by `trip_date`, and considers the current row and the previous six rows.
+
+### Step 3 — Vehicle Ranking
+
+The final query uses `DENSE_RANK()` to rank vehicles for each day according to their seven-day moving average.
+
+### Output
+
+The final result contains:
+
+- Vehicle license plate
+- Trip date
+- Daily fare
+- Seven-day moving average
+- Vehicle rank for that day
+
+The query was successfully executed on the populated database.
+
+---
+
+## 7. Performance Proof
+
+PostgreSQL performance testing was performed using:
+
+`EXPLAIN (ANALYZE, BUFFERS)`
+
+The raw PostgreSQL execution plans are stored in:
+
+`performance/postgres_explain_analyzes.txt`
+
+### Workflow 2 — SQL Window Analytics
+
+The Workflow 2 query processes approximately 100,001 rows from the `trips` table.
+
+The execution plan contains a sequential scan on `trips`.
+
+The filter is:
+
+`status = 'COMPLETED'`
+
+Only 2 rows were removed by this filter, meaning almost all rows in the table were completed trips.
+
+Because the filter is not selective, PostgreSQL determined that scanning the table sequentially was cheaper than using the completed-trip partial index.
+
+The partial index `idx_trips_status_completed` exists and can be used for completed-trip queries.
+
+A diagnostic execution with sequential scans disabled confirmed that PostgreSQL can use the index.
+
+Therefore, the sequential scan in the original execution plan is a cost-based optimizer decision rather than a missing-index problem.
+
+### Workflow 2 Execution Statistics
+
+- Rows processed: 100,001
+- Rows returned: 1,400
+- Rows removed by filter: 2
+- Planning Time: 2.204 ms
+- Execution Time: 108.391 ms
+
+The complete `EXPLAIN (ANALYZE, BUFFERS)` output is included in `performance/postgres_explain_analyzes.txt`.
+
+---
+
+## 8. SQL File Structure
+
+The SQL directory contains the following files:
+
+```text
+sql/
+├── 01_schema_ddl.sql
+├── 02_indexes.sql
+├── 03_triggers_and_audit.sql
+├── 04_stored_procedures.sql
+├── 05_materialized_views.sql
+└── 06_window_analytics.sql
+
+
 # RideSync A1 — MongoDB Setup & Execution
 
 Run all commands from the repository root.
