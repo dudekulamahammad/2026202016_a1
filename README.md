@@ -1,3 +1,4 @@
+**GitHub Repository:** GitHub - dudekulamahammad/2026202016_a1: RideSync – Global Ride-Hailing Network
 # RideSync A1 - Database Implementation
 
 ## 1. PostgreSQL Schema
@@ -565,3 +566,13 @@ performance/
 ```
  
 **MongoDB data is generated locally. No database dump or raw data is stored in GitHub.**
+
+## Assumptions
+ 
+* **Data-generation scripts:** MongoDB data generation is split into multiple Python scripts (`mongo_seeder.py`, `generate_trip_reviews.py`, `get_geo_summary.py`) instead of using a single generation file, with each script handling a specific data-generation or supporting task.
+ 
+* **MongoDB data volume:** The required high-volume MongoDB data is generated locally using the provided seeders; actual database records are not committed to GitHub, in accordance with the submission guidelines.
+ 
+* **Performance evidence:** MongoDB execution statistics and EXPLAIN outputs are stored as generated JSON/log files under `performance/` so that the performance analysis can be reproduced and inspected without storing database dumps.
+ 
+* **Workflow organization:** MongoDB workflows are maintained as separate `.js` files (`02_workflow3_geonear.js` and `03_workflow4_facet.js`), with `run_all_mongo_workflows.js` provided as a combined demonstration script for executing and displaying the final workflow outputs.
