@@ -1,0 +1,70 @@
+============================================================
+WORKFLOW 2 — SQL WINDOW ANALYTICS
+============================================================
+
+Query:
+06_window_analytics.sql
+
+EXPLAIN (ANALYZE, BUFFERS):
+
+
+"Sort  (cost=31098.83..31200.60 rows=40709 width=123) (actual time=107.305..107.355 rows=1400.00 loops=1)"
+"  Sort Key: (date_trunc('day'::text, trips.created_at)) DESC, (dense_rank() OVER w1)"
+"  Sort Method: quicksort  Memory: 155kB"
+"  Buffers: shared hit=2486, temp read=478 written=479"
+"  ->  WindowAgg  (cost=24420.00..25335.93 rows=40709 width=123) (actual time=105.324..106.281 rows=1400.00 loops=1)"
+"        Window: w1 AS (PARTITION BY (date_trunc('day'::text, trips.created_at)) ORDER BY (avg((sum(trips.fare_amount))) OVER w1) ROWS UNBOUNDED PRECEDING)"
+"        Storage: Memory  Maximum Storage: 17kB"
+"        Buffers: shared hit=2480, temp read=478 written=479"
+"        ->  Sort  (cost=24419.98..24521.75 rows=40709 width=83) (actual time=105.314..105.368 rows=1400.00 loops=1)"
+"              Sort Key: (date_trunc('day'::text, trips.created_at)), (avg((sum(trips.fare_amount))) OVER w1) DESC"
+"              Sort Method: quicksort  Memory: 125kB"
+"              Buffers: shared hit=2480, temp read=478 written=479"
+"              ->  Hash Join  (cost=14675.12..19353.59 rows=40709 width=83) (actual time=76.231..104.368 rows=1400.00 loops=1)"
+"                    Hash Cond: (trips.vehicle_id = v.id)"
+"                    Buffers: shared hit=2477, temp read=478 written=479"
+"                    ->  WindowAgg  (cost=14671.87..18317.91 rows=81418 width=88) (actual time=76.085..103.920 rows=1400.00 loops=1)"
+"                          Window: w1 AS (PARTITION BY trips.vehicle_id ORDER BY (date_trunc('day'::text, trips.created_at)) ROWS BETWEEN '6'::bigint PRECEDING AND CURRENT ROW)"
+"                          Storage: Memory  Maximum Storage: 17kB"
+"                          Buffers: shared hit=2476, temp read=478 written=479"
+"                          ->  GroupAggregate  (cost=14671.82..16893.09 rows=81418 width=56) (actual time=76.032..102.549 rows=1400.00 loops=1)"
+"                                Group Key: trips.vehicle_id, (date_trunc('day'::text, trips.created_at))"
+"                                Buffers: shared hit=2476, temp read=478 written=479"
+"                                ->  Sort  (cost=14671.82..14921.82 rows=100000 width=29) (actual time=76.001..86.397 rows=100001.00 loops=1)"
+"                                      Sort Key: trips.vehicle_id, (date_trunc('day'::text, trips.created_at))"
+"                                      Sort Method: external merge  Disk: 3824kB"
+"                                      Buffers: shared hit=2476, temp read=478 written=479"
+"                                      ->  Seq Scan on trips  (cost=0.00..3973.00 rows=100000 width=29) (actual time=0.080..30.104 rows=100001.00 loops=1)"
+"                                            Filter: (status = 'COMPLETED'::trip_status)"
+"                                            Rows Removed by Filter: 2"
+"                                            Buffers: shared hit=2473"
+"                    ->  Hash  (cost=2.00..2.00 rows=100 width=27) (actual time=0.133..0.133 rows=100.00 loops=1)"
+"                          Buckets: 1024  Batches: 1  Memory Usage: 14kB"
+"                          Buffers: shared hit=1"
+"                          ->  Seq Scan on vehicles v  (cost=0.00..2.00 rows=100 width=27) (actual time=0.061..0.074 rows=100.00 loops=1)"
+"                                Buffers: shared hit=1"
+"Planning:"
+"  Buffers: shared hit=289"
+"Planning Time: 2.204 ms"
+"Execution Time: 108.391 ms"
+
+
+PERFORMANCE ANALYSIS:
+The query processes completed trips and calculates daily revenue,
+7-day moving averages, and DENSE_RANK rankings.
+
+The trips table contains approximately 100,001 rows, of which only
+2 rows are not COMPLETED. PostgreSQL therefore chose a sequential
+scan instead of the partial index idx_trips_status_completed because
+the filter is not selective enough for an index scan to be cheaper.
+
+The partial index idx_trips_status_completed exists and can be used
+for COMPLETED-trip lookups. A diagnostic EXPLAIN with sequential scans
+disabled confirmed that PostgreSQL can use the index.
+
+The sequential scan in the original plan is therefore a cost-based
+optimizer decision rather than a missing-index problem.
+
+Execution Time: 108.391 ms
+
+
