@@ -1,7 +1,3 @@
--- =============================================================================
--- 03_TRIGGERS_AND_AUDIT.SQL
--- Purpose: Automated auditing of financial transactions (Wallet).
--- =============================================================================
 
 -- 1. AUDIT TRIGGER FUNCTION
 CREATE OR REPLACE FUNCTION fn_audit_wallet_change()
