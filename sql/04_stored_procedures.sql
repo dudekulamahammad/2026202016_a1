@@ -8,7 +8,7 @@ AS $$
 DECLARE
     v_current_balance NUMERIC;
 BEGIN
-    -- 1. Lock rider row to prevent race conditions
+
     SELECT wallet_balance
     INTO v_current_balance
     FROM riders
@@ -19,14 +19,14 @@ BEGIN
         RAISE EXCEPTION 'Rider with ID % not found', p_rider_id;
     END IF;
 
-    -- 2. Check sufficient balance
+
     IF v_current_balance < p_fare_amount THEN
         RAISE EXCEPTION
             'Insufficient balance. Required: %, Available: %',
             p_fare_amount, v_current_balance;
     END IF;
 
-    -- 3. Check vehicle is active
+
     IF NOT EXISTS (
         SELECT 1
         FROM vehicles
@@ -36,12 +36,12 @@ BEGIN
         RAISE EXCEPTION 'Vehicle % is not available', p_vehicle_id;
     END IF;
 
-    -- 4. Deduct fare
+
     UPDATE riders
     SET wallet_balance = wallet_balance - p_fare_amount
     WHERE id = p_rider_id;
 
-    -- 5. Create trip
+
     INSERT INTO trips (
         rider_id,
         vehicle_id,
