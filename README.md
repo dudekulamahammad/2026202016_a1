@@ -274,9 +274,9 @@ sql/
 ├── 04_stored_procedures.sql
 ├── 05_materialized_views.sql
 └── 06_window_analytics.sql
+---
 
-
-# RideSync A1 — MongoDB Setup & Execution
+## RideSync A1 — MongoDB Setup & Execution
 
 Run all commands from the repository root.
 
