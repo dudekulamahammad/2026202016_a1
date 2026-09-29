@@ -1,0 +1,254 @@
+# ============================================================
+# RideSync Project 2 — MongoDB Complete Run Script
+# Run from repo root:  ~/Desktop/Team_6_a1
+# ============================================================
+
+# ------------------------------------------------------------
+# 1. Start MongoDB server
+# ------------------------------------------------------------
+sudo systemctl start mongod
+
+# Verify it's alive (expect: { ok: 1 })
+mongosh --eval 'db.runCommand({ ping: 1 })'
+
+# ------------------------------------------------------------
+# 2. Install Python MongoDB driver
+# ------------------------------------------------------------
+python3 -m pip install pymongo
+
+# ------------------------------------------------------------
+# 3. Generate all mock data
+#    Creates: VehicleMetadata=150, TripReviews=100000, TelemetryPings=500000
+# ------------------------------------------------------------
+python3 data_generations/mongo_seeder.py
+
+# ------------------------------------------------------------
+# 4. Inspect one document from each collection
+# ------------------------------------------------------------
+mongosh --quiet --eval 'db = db.getSiblingDB("ridesync_db"); printjson(db.VehicleMetadata.findOne())'
+mongosh --quiet --eval 'db = db.getSiblingDB("ridesync_db"); printjson(db.TripReviews.findOne())'
+mongosh --quiet --eval 'db = db.getSiblingDB("ridesync_db"); printjson(db.TelemetryPings.findOne())'
+
+# ------------------------------------------------------------
+# 5. Create indexes
+#    Adds: location_2dsphere, createdAt_1 (TTL 7200s),
+#          rating_1, vehicleId_1
+#    (Ignore "collection already exists" warnings — indexes still create.)
+# ------------------------------------------------------------
+mongosh --quiet --file mongo/01_collections_and_indexes.js
+
+# ------------------------------------------------------------
+# 6. Verify indexes exist
+# ------------------------------------------------------------
+mongosh --quiet --eval '
+const db = db.getSiblingDB("ridesync_db");
+print("=== TelemetryPings indexes ===");
+printjson(db.TelemetryPings.getIndexes());
+print("=== TripReviews indexes ===");
+printjson(db.TripReviews.getIndexes());
+'
+
+
+or 
+
+mongosh --quiet --eval '
+const db = db.getSiblingDB("ridesync_db");
+db.TelemetryPings.createIndex({ location: "2dsphere" });
+db.TelemetryPings.createIndex({ createdAt: 1 }, { expireAfterSeconds: 7200 });
+db.TripReviews.createIndex({ rating: 1 });
+db.TripReviews.createIndex({ vehicleId: 1 });
+print("Indexes created");
+'
+
+# ------------------------------------------------------------
+# 7. WORKFLOW 3 — $geoNear (nearest available vehicle within 5km)
+#    Prints the 5 closest available vehicles.
+#    NOTE: if the .js file does not print, use the eval fallback below.
+# ------------------------------------------------------------
+mongosh --quiet --file mongo/02_workflow3_geonear.js
+
+# Fallback if the above prints nothing:
+mongosh --quiet --eval '
+const db = db.getSiblingDB("ridesync_db");
+db.TelemetryPings.aggregate([
+  { $geoNear: {
+      near: { type: "Point", coordinates: [-73.9857, 40.7484] },
+      distanceField: "dist_meters",
+      maxDistance: 5000,
+      spherical: true,
+      query: { isAvailable: true }
+  }},
+  { $sort: { dist_meters: 1 } },
+  { $limit: 5 },
+  { $project: {
+      _id: 0,
+      vehicleId: 1,
+      distance_km: { $divide: ["$dist_meters", 1000] },
+      location: 1
+  }}
+]).forEach(printjson);
+'
+
+# ------------------------------------------------------------
+# 8. WORKFLOW 4 — $facet (review analytics)
+#    Rating distribution, top 10 feedback tags, average rating.
+# ------------------------------------------------------------
+mongosh --quiet --file mongo/03_workflow4_facet.js
+
+# Fallback if the above prints nothing:
+mongosh --quiet --eval '
+const db = db.getSiblingDB("ridesync_db");
+db.TripReviews.aggregate([
+  { $facet: {
+      rating_distribution: [
+        { $group: { _id: "$rating", count: { $sum: 1 } } },
+        { $sort: { _id: -1 } }
+      ],
+      common_feedback: [
+        { $unwind: "$feedback_tags" },
+        { $group: { _id: "$feedback_tags", total_occurrences: { $sum: 1 } } },
+        { $sort: { total_occurrences: -1 } },
+        { $limit: 10 }
+      ],
+      overall_average_rating: [
+        { $group: { _id: null, average_rating: { $avg: "$rating" } } },
+        { $project: { _id: 0, average_rating: 1 } }
+      ]
+  }}
+]).forEach(printjson);
+'
+
+# ------------------------------------------------------------
+# 9. EXPLAIN proof — Workflow 3 uses the 2dsphere index
+# ------------------------------------------------------------
+mongosh --quiet --eval '
+const db = db.getSiblingDB("ridesync_db");
+const explain = db.TelemetryPings.explain("executionStats").aggregate([
+  { $geoNear: {
+      near: { type: "Point", coordinates: [-73.9857, 40.7484] },
+      distanceField: "dist_meters",
+      maxDistance: 5000,
+      spherical: true,
+      query: { isAvailable: true }
+  }},
+  { $limit: 5 }
+]);
+const stats = explain.stages[0].$geoNearCursor.executionStats;
+print("Index used   :", explain.stages[0].$geoNearCursor.queryPlanner.winningPlan.inputStage.indexName);
+print("nReturned    :", stats.nReturned);
+print("Execution ms :", stats.executionTimeMillis);
+'
+
+# ------------------------------------------------------------
+# 10. EXPLAIN proof — Workflow 4 ($facet)
+# ------------------------------------------------------------
+mongosh --quiet --eval '
+const db = db.getSiblingDB("ridesync_db");
+const explain = db.TripReviews.explain("executionStats").aggregate([
+  { $facet: {
+      rating_distribution: [
+        { $group: { _id: "$rating", count: { $sum: 1 } } },
+        { $sort: { _id: -1 } }
+      ],
+      common_feedback: [
+        { $unwind: "$feedback_tags" },
+        { $group: { _id: "$feedback_tags", total_occurrences: { $sum: 1 } } },
+        { $sort: { total_occurrences: -1 } },
+        { $limit: 10 }
+      ],
+      overall_average_rating: [
+        { $group: { _id: null, average_rating: { $avg: "$rating" } } },
+        { $project: { _id: 0, average_rating: 1 } }
+      ]
+  }}
+]);
+const stats = explain.stages[0].$cursor.executionStats;
+print("nReturned    :", stats.nReturned);
+print("DocsExamined :", stats.totalDocsExamined);
+print("Execution ms :", stats.executionTimeMillis);
+'
+
+mongosh --quiet --eval '
+const db = db.getSiblingDB("ridesync_db");
+print("=== VehicleMetadata (1 sample) ===");
+printjson(db.VehicleMetadata.findOne());
+print("=== TripReviews (1 sample) ===");
+printjson(db.TripReviews.findOne());
+print("=== TelemetryPings (1 sample) ===");
+printjson(db.TelemetryPings.findOne());
+'
+
+# ------------------------------------------------------------
+# 11. FULL COMBINED DEMO — best for viva
+#     Runs counts + indexes + Workflow 3 + Workflow 4 + explains
+# ------------------------------------------------------------
+mongosh --quiet --file mongo/run_all_mongo_workflows.js
+
+# ------------------------------------------------------------
+# 12. Generate performance stats JSON files
+#     Writes: performance/mongo_execution_stats.json
+#             performance/mongo_explain_raw.json
+# ------------------------------------------------------------
+python3 data_generations/generate_mongo_stats.py
+
+# ------------------------------------------------------------
+# 13. Show the generated performance summary
+# ------------------------------------------------------------
+cat performance/mongo_execution_stats.json
+
+# ------------------------------------------------------------
+# 14. (Optional) Clean Python cache before git commit
+# ------------------------------------------------------------
+find . -name "__pycache__" -type d -prune -exec rm -rf {} +
+find . -name "*.pyc" -delete
+
+# ------------------------------------------------------------
+# 15. (Optional) Git commit & push
+# ------------------------------------------------------------
+git status
+git add .
+git commit -m "Add RideSync MongoDB implementation"
+git push origin master
+# If your branch is main:  git push origin main
+
+
+mongosh --quiet --eval '
+const db = db.getSiblingDB("ridesync_db");
+db.VehicleMetadata.insertOne({
+  vehicleId: "V00999",
+  licensePlate: "NYC-999",
+  class: "SUV",
+  features: ["AC", "GPS", "WiFi"],
+  inspection: { status: "PASSED", date: new Date() },
+  maintenance: { lastService: new Date(), serviceDue: false },
+  insurance: { provider: "RideSafe", valid: true },
+  updatedAt: new Date()
+});
+print("Inserted into VehicleMetadata");
+'
+
+mongosh --quiet --eval '
+const db = db.getSiblingDB("ridesync_db");
+db.TripReviews.insertOne({
+  vehicleId: "V00042",
+  rating: 5,
+  feedback_tags: ["clean", "friendly", "fast"],
+  driver_feedback: "Excellent ride, very smooth",
+  createdAt: new Date()
+});
+print("Inserted into TripReviews");
+'
+
+mongosh --quiet --eval '
+const db = db.getSiblingDB("ridesync_db");
+db.TelemetryPings.insertOne({
+  vehicleId: "V00042",
+  isAvailable: true,
+  location: {
+    type: "Point",
+    coordinates: [-73.9857, 40.7484]      // [longitude, latitude]
+  },
+  createdAt: new Date()
+});
+print("Inserted into TelemetryPings");
+'
