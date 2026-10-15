@@ -1,262 +1,148 @@
-from pymongo import MongoClient
-from datetime import datetime
+"""
+RideSync - capture MongoDB explain("executionStats") evidence for Workflows 3 and 4.
+
+Writes (run from the repository root):
+    performance/mongo_explain_raw.json      full explain documents
+    performance/mongo_execution_stats.json  compact summary
+
+A2: pipelines updated to the fixed Workflow 3 / 4 versions (same as
+mongo/02 and mongo/03). Connection is read from MONGO_URI / MONGO_DB.
+
+Run `python3 data_generations/mongo_seeder.py --live` for a minute first, so
+Workflow 3 has fresh pings.
+"""
+
 import json
+import os
+from datetime import datetime, timedelta, timezone
 
-client = MongoClient("mongodb://127.0.0.1:27017")
-db = client["ridesync_db"]
+from pymongo import MongoClient
 
-# ============================================================
-# WORKFLOW 3 — $geoNear
-# ============================================================
+from mongo_seeder import mongo_db_name, mongo_uri
 
-geo_pipeline = [
-    {
-        "$geoNear": {
-            "near": {
-                "type": "Point",
-                "coordinates": [-73.9857, 40.7484]
-            },
-            "distanceField": "dist_meters",
+OUT_DIR = "performance"
+RIDER_LOCATION = [-73.9857, 40.7484]
+
+
+def geo_pipeline():
+    since = datetime.now(timezone.utc) - timedelta(minutes=10)
+    return [
+        {"$geoNear": {
+            "near": {"type": "Point", "coordinates": RIDER_LOCATION},
+            "key": "location",
+            "distanceField": "distanceMeters",
             "maxDistance": 5000,
             "spherical": True,
-            "query": {"isAvailable": True}
-        }
-    },
-    {"$sort": {"dist_meters": 1}},
-    {"$limit": 5},
-    {
-        "$project": {
-            "_id": 0,
-            "vehicleId": 1,
-            "distance_km": {"$divide": ["$dist_meters", 1000]},
-            "location": 1
-        }
-    }
-]
-
-geo_explain = db.command(
-    "explain",
-    {
-        "aggregate": "TelemetryPings",
-        "pipeline": geo_pipeline,
-        "cursor": {}
-    },
-    verbosity="executionStats"
-)
-
-# ============================================================
-# WORKFLOW 4 — $facet
-# ============================================================
-
-facet_pipeline = [
-    {
-        "$facet": {
-            "rating_distribution": [
-                {
-                    "$group": {
-                        "_id": "$rating",
-                        "count": {"$sum": 1}
-                    }
-                },
-                {"$sort": {"_id": -1}}
-            ],
-
-            "common_feedback": [
-                {"$unwind": "$feedback_tags"},
-                {
-                    "$group": {
-                        "_id": "$feedback_tags",
-                        "total_occurrences": {"$sum": 1}
-                    }
-                },
-                {"$sort": {"total_occurrences": -1}},
-                {"$limit": 10}
-            ],
-
-            "overall_average_rating": [
-                {
-                    "$group": {
-                        "_id": None,
-                        "average_rating": {"$avg": "$rating"}
-                    }
-                },
-                {
-                    "$project": {
-                        "_id": 0,
-                        "average_rating": 1
-                    }
-                }
-            ]
-        }
-    }
-]
-
-facet_explain = db.command(
-    "explain",
-    {
-        "aggregate": "TripReviews",
-        "pipeline": facet_pipeline,
-        "cursor": {}
-    },
-    verbosity="executionStats"
-)
-
-# ============================================================
-# Save RAW explain evidence
-# ============================================================
-
-raw = {
-    "generated_at": datetime.now().isoformat(),
-    "workflow3_geonear": geo_explain,
-    "workflow4_facet": facet_explain
-}
-
-with open("performance/mongo_explain_raw.json", "w") as f:
-    json.dump(raw, f, indent=2, default=str)
-
-# ============================================================
-# Extract useful statistics from MongoDB 8 explain output
-# ============================================================
-
-def collect_stage_stats(obj, stats):
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-
-            if key == "indexName" and isinstance(value, str):
-                stats["indexes"].add(value)
-
-            if key == "keysExamined" and isinstance(value, int):
-                stats["keys_examined"].append(value)
-
-            if key == "docsExamined" and isinstance(value, int):
-                stats["docs_examined"].append(value)
-
-            if key == "nReturned" and isinstance(value, (int, float)):
-                stats["nReturned"].append(value)
-
-            if key == "executionTimeMillisEstimate" and isinstance(value, (int, float)):
-                stats["execution_times"].append(value)
-
-            collect_stage_stats(value, stats)
-
-    elif isinstance(obj, list):
-        for item in obj:
-            collect_stage_stats(item, stats)
+            "query": {"createdAt": {"$gte": since}},
+        }},
+        {"$group": {"_id": "$vehicleId", "latest": {"$top": {
+            "sortBy": {"createdAt": -1},
+            "output": {"isAvailable": "$isAvailable", "distanceMeters": "$distanceMeters",
+                       "location": "$location", "lastSeen": "$createdAt"}}}}},
+        {"$match": {"latest.isAvailable": True}},
+        {"$sort": {"latest.distanceMeters": 1}},
+        {"$limit": 5},
+        {"$lookup": {"from": "VehicleMetadata", "localField": "_id", "foreignField": "vehicleId",
+                     "as": "meta", "pipeline": [{"$project": {"_id": 0, "licensePlate": 1, "class": 1}}]}},
+        {"$project": {"_id": 0, "vehicleId": "$_id",
+                      "licensePlate": {"$first": "$meta.licensePlate"},
+                      "distanceKm": {"$round": [{"$divide": ["$latest.distanceMeters", 1000]}, 3]}}},
+    ]
 
 
-def summarize(explain):
-    stats = {
-        "indexes": set(),
-        "keys_examined": [],
-        "docs_examined": [],
-        "nReturned": [],
-        "execution_times": []
-    }
-
-    collect_stage_stats(explain, stats)
-
-    return {
-        "indexes_observed": sorted(stats["indexes"]),
-        "max_keysExamined_observed": max(stats["keys_examined"], default=0),
-        "max_docsExamined_observed": max(stats["docs_examined"], default=0),
-        "final_stage_nReturned": (
-            stats["nReturned"][-1] if stats["nReturned"] else None
-        ),
-        "last_executionTimeMillisEstimate": (
-            stats["execution_times"][-1]
-            if stats["execution_times"]
-            else None
-        )
-    }
-
-
-geo_summary = summarize(geo_explain)
-facet_summary = summarize(facet_explain)
-
-# ============================================================
-# Compact performance report
-# ============================================================
-
-report = {
-    "database": "ridesync_db",
-    "mongo_version": db.client.server_info()["version"],
-    "generated_at": datetime.now().isoformat(),
-
-    "workflow3_geonear": {
-        "collection": "TelemetryPings",
-        "operator": "$geoNear",
-        "description": "Find 5 available vehicles within 5 km",
-        "max_distance_meters": 5000,
-        "filter": {
-            "isAvailable": True
-        },
-        "index_used": geo_summary["indexes_observed"],
-        "nReturned_final_stage": geo_summary["final_stage_nReturned"],
-        "max_keysExamined_observed": geo_summary["max_keysExamined_observed"],
-        "max_docsExamined_observed": geo_summary["max_docsExamined_observed"],
-        "executionTimeMillisEstimate_last": geo_summary[
-            "last_executionTimeMillisEstimate"
-        ]
-    },
-
-    "workflow4_facet": {
-        "collection": "TripReviews",
-        "operators": [
-            "$facet",
-            "$unwind"
+FACET_PIPELINE = [
+    {"$facet": {
+        "rating_distribution": [
+            {"$group": {"_id": "$rating", "count": {"$sum": 1}}},
+            {"$sort": {"_id": -1}},
         ],
-        "description": "Rating distribution, common feedback tags, overall average rating",
-        "nReturned_final_stage": facet_summary["final_stage_nReturned"],
-        "max_keysExamined_observed": facet_summary["max_keysExamined_observed"],
-        "max_docsExamined_observed": facet_summary["max_docsExamined_observed"],
-        "executionTimeMillisEstimate_last": facet_summary[
-            "last_executionTimeMillisEstimate"
-        ]
+        "common_feedback": [
+            {"$unwind": "$feedback_tags"},
+            {"$group": {"_id": "$feedback_tags", "total_occurrences": {"$sum": 1}}},
+            {"$sort": {"total_occurrences": -1, "_id": 1}},
+            {"$limit": 10},
+        ],
+        "overall_average_rating": [
+            {"$group": {"_id": None, "average_rating": {"$avg": "$rating"}, "total_reviews": {"$sum": 1}}},
+            {"$project": {"_id": 0, "average_rating": {"$round": ["$average_rating", 3]}, "total_reviews": 1}},
+        ],
+    }}
+]
+
+
+def explain(db, collection, pipeline):
+    return db.command("explain", {"aggregate": collection, "pipeline": pipeline, "cursor": {}},
+                      verbosity="executionStats")
+
+
+def summarize(doc):
+    s = {"indexes": set(), "stages": set(), "keys": [], "docs": [], "ms": []}
+
+    def walk(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k == "indexName" and isinstance(v, str):
+                    s["indexes"].add(v)
+                elif k == "stage" and isinstance(v, str):
+                    s["stages"].add(v)
+                elif k in ("totalKeysExamined", "keysExamined") and isinstance(v, (int, float)):
+                    s["keys"].append(v)
+                elif k in ("totalDocsExamined", "docsExamined") and isinstance(v, (int, float)):
+                    s["docs"].append(v)
+                elif k in ("executionTimeMillis", "executionTimeMillisEstimate") and isinstance(v, (int, float)):
+                    s["ms"].append(v)
+                walk(v)
+        elif isinstance(o, list):
+            for i in o:
+                walk(i)
+
+    walk(doc)
+    return {
+        "indexes_used": sorted(s["indexes"]),
+        "plan_stages": sorted(s["stages"]),
+        "collscan": "COLLSCAN" in s["stages"],
+        "max_keysExamined": max(s["keys"], default=0),
+        "max_docsExamined": max(s["docs"], default=0),
+        "max_executionTimeMillis": max(s["ms"], default=None),
     }
-}
 
-with open("performance/mongo_execution_stats.json", "w") as f:
-    json.dump(report, f, indent=2)
 
-print("======================================")
-print("MongoDB Execution Statistics")
-print("======================================")
+def main():
+    client = MongoClient(mongo_uri())
+    db = client[mongo_db_name()]
+    os.makedirs(OUT_DIR, exist_ok=True)
 
-print("\nWorkflow 3 — $geoNear")
-print("Index:", geo_summary["indexes_observed"])
-print("Returned:", geo_summary["final_stage_nReturned"])
-print(
-    "Execution estimate:",
-    geo_summary["last_executionTimeMillisEstimate"],
-    "ms"
-)
-print(
-    "Max keys examined:",
-    geo_summary["max_keysExamined_observed"]
-)
-print(
-    "Max documents examined:",
-    geo_summary["max_docsExamined_observed"]
-)
+    geo = explain(db, "TelemetryPings", geo_pipeline())
+    facet = explain(db, "TripReviews", FACET_PIPELINE)
+    now = datetime.now(timezone.utc).isoformat()
 
-print("\nWorkflow 4 — $facet")
-print("Returned:", facet_summary["final_stage_nReturned"])
-print(
-    "Execution estimate:",
-    facet_summary["last_executionTimeMillisEstimate"],
-    "ms"
-)
-print(
-    "Max keys examined:",
-    facet_summary["max_keysExamined_observed"]
-)
-print(
-    "Max documents examined:",
-    facet_summary["max_docsExamined_observed"]
-)
+    with open(os.path.join(OUT_DIR, "mongo_explain_raw.json"), "w") as f:
+        json.dump({"generated_at": now, "workflow3_geonear": geo, "workflow4_facet": facet},
+                  f, indent=2, default=str)
 
-print("\nSaved:")
-print("performance/mongo_execution_stats.json")
-print("performance/mongo_explain_raw.json")
+    report = {
+        "database": db.name,
+        "mongo_version": client.server_info()["version"],
+        "generated_at": now,
+        "counts": {c: db[c].estimated_document_count()
+                   for c in ("VehicleMetadata", "TripReviews", "TelemetryPings")},
+        "workflow3_geonear": {
+            "description": "Nearest available vehicles (latest fresh ping per vehicle) within 5 km",
+            **summarize(geo),
+        },
+        "workflow4_facet": {
+            "description": "Rating distribution, top tags ($unwind), average rating",
+            "note": "$facet sub-pipelines cannot use indexes; a collection scan is expected",
+            **summarize(facet),
+        },
+    }
+    with open(os.path.join(OUT_DIR, "mongo_execution_stats.json"), "w") as f:
+        json.dump(report, f, indent=2)
 
-client.close()
+    print(json.dumps(report, indent=2))
+    print(f"\nSaved {OUT_DIR}/mongo_execution_stats.json and {OUT_DIR}/mongo_explain_raw.json")
+    client.close()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,263 +1,122 @@
-from pymongo import MongoClient
-import json
+"""
+RideSync - Workflow 3 geo summary (prints only, writes no files).
 
-client = MongoClient("mongodb://127.0.0.1:27017")
-db = client["ridesync_db"]
+For a few rider locations it runs the fixed Workflow 3 pipeline (same as
+mongo/02_workflow3_geonear.js) and prints how many vehicles are near and
+available, the nearest one, and the explain statistics for the first
+location (index used, keys / documents examined, time).
+
+    python3 data_generations/get_geo_summary.py
+    python3 data_generations/get_geo_summary.py --fresh-minutes 30
+
+A2 fixes vs the A1 version of this file:
+  * The A1 $facet pipeline here ran $unwind on feedback_tags BEFORE $facet,
+    so every review was counted once per tag and the rating distribution
+    and average were inflated. Workflow 4 evidence is now produced only by
+    generate_mongo_stats.py (correct pipeline); this script focuses on geo.
+  * It no longer overwrites performance/mongo_execution_stats.json (that is
+    generate_mongo_stats.py's job).
+  * Uses the fixed Workflow 3 pipeline (one row per vehicle, latest fresh
+    ping) and the MONGO_URI / MONGO_DB environment variables.
+"""
+
+import argparse
+from datetime import datetime, timedelta, timezone
+
+from pymongo import MongoClient
+
+from mongo_seeder import mongo_db_name, mongo_uri
+
+LOCATIONS = [
+    ("Empire State Building", [-73.9857, 40.7484]),
+    ("Times Square", [-73.9855, 40.7580]),
+    ("Union Square", [-73.9903, 40.7359]),
+    ("World Trade Center", [-74.0134, 40.7127]),
+]
+MAX_DISTANCE_M = 5000
+
+
+def nearest_pipeline(coords, since, limit=5):
+    return [
+        {"$geoNear": {
+            "near": {"type": "Point", "coordinates": coords},
+            "key": "location",
+            "distanceField": "distanceMeters",
+            "maxDistance": MAX_DISTANCE_M,
+            "spherical": True,
+            "query": {"createdAt": {"$gte": since}},
+        }},
+        {"$group": {"_id": "$vehicleId", "latest": {"$top": {
+            "sortBy": {"createdAt": -1},
+            "output": {"isAvailable": "$isAvailable", "distanceMeters": "$distanceMeters"}}}}},
+        {"$match": {"latest.isAvailable": True}},
+        {"$sort": {"latest.distanceMeters": 1}},
+        {"$limit": limit},
+        {"$lookup": {"from": "VehicleMetadata", "localField": "_id", "foreignField": "vehicleId",
+                     "as": "meta", "pipeline": [{"$project": {"_id": 0, "licensePlate": 1}}]}},
+        {"$project": {"_id": 0, "vehicleId": "$_id",
+                      "licensePlate": {"$first": "$meta.licensePlate"},
+                      "distanceKm": {"$round": [{"$divide": ["$latest.distanceMeters", 1000]}, 3]}}},
+    ]
 
 
 def find_values(obj, key):
-    """Recursively find all values for a key in a MongoDB explain result."""
-    results = []
-
+    """Recursively collect all values for a key in an explain document."""
+    found = []
     if isinstance(obj, dict):
         for k, v in obj.items():
             if k == key:
-                results.append(v)
-            results.extend(find_values(v, key))
-
+                found.append(v)
+            found.extend(find_values(v, key))
     elif isinstance(obj, list):
         for item in obj:
-            results.extend(find_values(item, key))
-
-    return results
-
-
-# -----------------------------
-# Workflow 3: GEO NEAR
-# -----------------------------
-
-geo_pipeline = [
-    {
-        "$geoNear": {
-            "near": {
-                "type": "Point",
-                "coordinates": [-73.9857, 40.7484]
-            },
-            "distanceField": "dist_meters",
-            "maxDistance": 5000,
-            "spherical": True,
-            "query": {
-                "isAvailable": True
-            }
-        }
-    },
-    {"$sort": {"dist_meters": 1}},
-    {"$limit": 5},
-    {
-        "$project": {
-            "_id": 0,
-            "vehicleId": 1,
-            "distance_km": {
-                "$divide": ["$dist_meters", 1000]
-            },
-            "location": 1
-        }
-    }
-]
-
-geo_explain = db.command(
-    "explain",
-    {
-        "aggregate": "TelemetryPings",
-        "pipeline": geo_pipeline,
-        "cursor": {}
-    },
-    verbosity="executionStats"
-)
+            found.extend(find_values(item, key))
+    return found
 
 
-# MongoDB 8 places these values inside the $geoNearCursor stage,
-# so search recursively instead of assuming a fixed structure.
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--fresh-minutes", type=int, default=10, help="ignore pings older than this")
+    args = ap.parse_args()
 
-geo_execution_times = find_values(
-    geo_explain,
-    "executionTimeMillisEstimate"
-)
+    client = MongoClient(mongo_uri())
+    db = client[mongo_db_name()]
+    since = datetime.now(timezone.utc) - timedelta(minutes=args.fresh_minutes)
 
-geo_nreturned = find_values(
-    geo_explain,
-    "nReturned"
-)
+    fresh = db.TelemetryPings.count_documents({"createdAt": {"$gte": since}})
+    print("=" * 70)
+    print(f"WORKFLOW 3 GEO SUMMARY  ({db.name}, pings newer than {args.fresh_minutes} min: {fresh:,})")
+    print("=" * 70)
+    if fresh == 0:
+        print("No fresh pings. Run: python3 data_generations/mongo_seeder.py --live")
 
-geo_keys = find_values(
-    geo_explain,
-    "keysExamined"
-)
+    for label, coords in LOCATIONS:
+        rows = list(db.TelemetryPings.aggregate(nearest_pipeline(coords, since)))
+        nearest = f"{rows[0]['licensePlate']} at {rows[0]['distanceKm']} km" if rows else "none"
+        print(f"{label:<24} available within 5 km (top 5 shown): {len(rows)}   nearest: {nearest}")
 
-geo_docs = find_values(
-    geo_explain,
-    "docsExamined"
-)
-
-geo_indexes = find_values(
-    geo_explain,
-    "indexName"
-)
-
-
-# Find the final nReturned from the pipeline.
-geo_final_returned = None
-
-if geo_nreturned:
-    # Usually the final stage is the last nReturned value.
-    geo_final_returned = geo_nreturned[-1]
-
-
-# Find maximum keys/docs examined.
-geo_total_keys = max(geo_keys) if geo_keys else None
-geo_total_docs = max(geo_docs) if geo_docs else None
-
-
-# Get useful index names.
-geo_indexes = sorted(set(str(x) for x in geo_indexes))
+    label, coords = LOCATIONS[0]
+    explain = db.command(
+        "explain",
+        {"aggregate": "TelemetryPings", "pipeline": nearest_pipeline(coords, since), "cursor": {}},
+        verbosity="executionStats",
+    )
+    keys = [v for v in find_values(explain, "totalKeysExamined") + find_values(explain, "keysExamined")
+            if isinstance(v, (int, float))]
+    docs = [v for v in find_values(explain, "totalDocsExamined") + find_values(explain, "docsExamined")
+            if isinstance(v, (int, float))]
+    times = [v for v in find_values(explain, "executionTimeMillis") if isinstance(v, (int, float))]
+    stages = sorted({s for s in find_values(explain, "stage") if isinstance(s, str)})
+    print()
+    print(f"Explain for {label}:")
+    print(f"  indexes used   : {sorted({str(x) for x in find_values(explain, 'indexName')})}")
+    print(f"  plan stages    : {stages}")
+    print(f"  keys examined  : {max(keys, default=0):,}")
+    print(f"  docs examined  : {max(docs, default=0):,}")
+    print(f"  execution time : {max(times, default=0)} ms")
+    print(f"  COLLSCAN       : {'COLLSCAN' in stages}")
+    client.close()
 
 
-# -----------------------------
-# Workflow 4: FACET
-# -----------------------------
-
-facet_pipeline = [
-    {"$unwind": "$feedback_tags"},
-    {
-        "$facet": {
-            "rating_distribution": [
-                {
-                    "$group": {
-                        "_id": "$rating",
-                        "count": {"$sum": 1}
-                    }
-                },
-                {"$sort": {"_id": -1}}
-            ],
-            "common_feedback": [
-                {
-                    "$group": {
-                        "_id": "$feedback_tags",
-                        "total_occurrences": {"$sum": 1}
-                    }
-                },
-                {"$sort": {"total_occurrences": -1}},
-                {"$limit": 10}
-            ],
-            "overall_average_rating": [
-                {
-                    "$group": {
-                        "_id": None,
-                        "average_rating": {"$avg": "$rating"}
-                    }
-                },
-                {
-                    "$project": {
-                        "_id": 0,
-                        "average_rating": 1
-                    }
-                }
-            ]
-        }
-    }
-]
-
-facet_explain = db.command(
-    "explain",
-    {
-        "aggregate": "TripReviews",
-        "pipeline": facet_pipeline,
-        "cursor": {}
-    },
-    verbosity="executionStats"
-)
-
-facet_times = find_values(
-    facet_explain,
-    "executionTimeMillisEstimate"
-)
-
-facet_nreturned = find_values(
-    facet_explain,
-    "nReturned"
-)
-
-facet_keys = find_values(
-    facet_explain,
-    "keysExamined"
-)
-
-facet_docs = find_values(
-    facet_explain,
-    "docsExamined"
-)
-
-
-facet_final_returned = (
-    facet_nreturned[-1]
-    if facet_nreturned
-    else None
-)
-
-facet_total_keys = (
-    max(facet_keys)
-    if facet_keys
-    else 0
-)
-
-facet_total_docs = (
-    max(facet_docs)
-    if facet_docs
-    else 0
-)
-
-
-# -----------------------------
-# Compact report
-# -----------------------------
-
-report = {
-    "database": "ridesync_db",
-    "mongo_version": db.client.server_info()["version"],
-
-    "workflow3_geonear": {
-        "collection": "TelemetryPings",
-        "query": "Find 5 available vehicles within 5 km",
-        "index_used": geo_indexes,
-        "nReturned_final_stage": geo_final_returned,
-        "max_keysExamined_observed": geo_total_keys,
-        "max_docsExamined_observed": geo_total_docs,
-        "executionTimeMillisEstimate_last": (
-            geo_execution_times[-1]
-            if geo_execution_times
-            else None
-        )
-    },
-
-    "workflow4_facet": {
-        "collection": "TripReviews",
-        "query": "Rating distribution, common feedback, average rating",
-        "nReturned_final_stage": facet_final_returned,
-        "max_keysExamined_observed": facet_total_keys,
-        "max_docsExamined_observed": facet_total_docs,
-        "executionTimeMillisEstimate_last": (
-            facet_times[-1]
-            if facet_times
-            else None
-        )
-    }
-}
-
-
-with open(
-    "performance/mongo_execution_stats.json",
-    "w"
-) as f:
-    json.dump(report, f, indent=2)
-
-
-print("======================================")
-print("MongoDB Performance Summary")
-print("======================================")
-print(json.dumps(report, indent=2))
-print()
-print("Saved to:")
-print("performance/mongo_execution_stats.json")
-
-
-client.close()
+if __name__ == "__main__":
+    main()
