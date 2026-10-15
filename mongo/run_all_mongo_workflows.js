@@ -1,304 +1,109 @@
 // ============================================================
-// RideSync - MongoDB Complete Workflow Runner
+// RideSync - MongoDB demo runner (counts, indexes, Workflow 3 + 4, explain)
+// Run:  mongosh --quiet --file mongo/run_all_mongo_workflows.js
+// ============================================================
+// A2: pipelines updated to match 02_workflow3_geonear.js and
+// 03_workflow4_facet.js (keep them in sync). Explain statistics are now
+// found by walking the whole explain document, because the stage layout
+// differs between MongoDB versions.
 // ============================================================
 
-const dbName = "ridesync_db";
-const db = db.getSiblingDB(dbName);
+db = db.getSiblingDB("ridesync_db");
+const line = "============================================================";
 
-print("============================================================");
-print("              RIDESYNC MONGODB EXECUTION REPORT");
-print("============================================================");
-print("Database: " + dbName);
-print("");
-
-// ------------------------------------------------------------
-// DATABASE SUMMARY
-// ------------------------------------------------------------
-
-print("DATABASE SUMMARY");
-print("------------------------------------------------------------");
-
-const collections = [
-  "VehicleMetadata",
-  "TripReviews",
-  "TelemetryPings"
-];
-
-collections.forEach(function(name) {
-  print(name + " : " + db.getCollection(name).countDocuments() + " documents");
-});
-
-print("");
-
-// ------------------------------------------------------------
-// INDEX SUMMARY
-// ------------------------------------------------------------
-
-print("INDEX SUMMARY");
-print("------------------------------------------------------------");
-
-collections.forEach(function(name) {
-  print("");
-  print(name + ":");
-
-  db.getCollection(name).getIndexes().forEach(function(index) {
-    let details = "  - " + index.name;
-
-    if (index.expireAfterSeconds !== undefined) {
-      details += " (TTL: " + index.expireAfterSeconds + " seconds)";
-    }
-
-    print(details);
+function walk(obj, fn) {
+  if (Array.isArray(obj)) obj.forEach(o => walk(o, fn));
+  else if (obj && typeof obj === "object") {
+    for (const [k, v] of Object.entries(obj)) { fn(k, v); walk(v, fn); }
+  }
+}
+function explainSummary(explain) {
+  const s = { indexes: new Set(), keys: 0, docs: 0, stages: new Set(), ms: null };
+  walk(explain, (k, v) => {
+    if (k === "indexName" && typeof v === "string") s.indexes.add(v);
+    if (k === "totalKeysExamined" || k === "keysExamined") s.keys = Math.max(s.keys, Number(v));
+    if (k === "totalDocsExamined" || k === "docsExamined") s.docs = Math.max(s.docs, Number(v));
+    if (k === "stage" && typeof v === "string") s.stages.add(v);
+    if (k === "executionTimeMillis" && s.ms === null) s.ms = Number(v);
   });
+  return s;
+}
+function printExplain(title, explain) {
+  const s = explainSummary(explain);
+  print(title);
+  print("  index(es) used     : " + ([...s.indexes].join(", ") || "none"));
+  print("  plan stages        : " + [...s.stages].join(", "));
+  print("  keys examined (max): " + s.keys);
+  print("  docs examined (max): " + s.docs);
+  print("  execution time ms  : " + s.ms);
+  print("  COLLSCAN present   : " + s.stages.has("COLLSCAN"));
+}
+
+print(line); print("              RIDESYNC MONGODB EXECUTION REPORT"); print(line);
+print("Database: " + db.getName() + "\n");
+
+const collections = ["VehicleMetadata", "TripReviews", "TelemetryPings"];
+print("DATABASE SUMMARY");
+collections.forEach(n => print("  " + n.padEnd(16) + ": " + db[n].countDocuments() + " documents"));
+const freshCount = db.TelemetryPings.countDocuments({ createdAt: { $gte: new Date(Date.now() - 10 * 60 * 1000) } });
+print("  pings in last 10 min: " + freshCount);
+
+print("\nINDEX SUMMARY");
+collections.forEach(n => {
+  print("  " + n + ":");
+  db[n].getIndexes().forEach(ix => print("    - " + ix.name +
+    (ix.expireAfterSeconds !== undefined ? " (TTL " + ix.expireAfterSeconds + " s)" : "")));
 });
 
-print("");
-
-// ============================================================
-// WORKFLOW 3
-// NEAREST AVAILABLE VEHICLE
-// ============================================================
-
-print("============================================================");
-print("WORKFLOW 3: NEAREST AVAILABLE VEHICLE");
-print("============================================================");
-
-const riderLocation = [-73.9857, 40.7484];
-
-print("Search radius : 5 km");
-print("Location      : [" + riderLocation[0] + ", " + riderLocation[1] + "]");
-print("Filter        : isAvailable = true");
-print("Index         : location_2dsphere");
-print("");
-
-const workflow3Pipeline = [
-  {
-    $geoNear: {
-      near: {
-        type: "Point",
-        coordinates: riderLocation
-      },
-      distanceField: "dist_meters",
-      maxDistance: 5000,
-      spherical: true,
-      query: {
-        isAvailable: true
-      }
-    }
-  },
-  {
-    $limit: 5
-  },
-  {
-    $project: {
-      _id: 0,
-      vehicleId: 1,
-      isAvailable: 1,
-      location: 1,
-      distance_km: {
-        $round: [
-          { $divide: ["$dist_meters", 1000] },
-          3
-        ]
-      }
-    }
-  }
+// ---------------- WORKFLOW 3 ----------------
+print("\n" + line); print("WORKFLOW 3: NEAREST AVAILABLE VEHICLES ($geoNear, 5 km)"); print(line);
+const riderLocation = [72.8426, 19.0178];   // Dadar station, Mumbai
+const since = new Date(Date.now() - 10 * 60 * 1000);
+const w3 = [
+  { $geoNear: { near: { type: "Point", coordinates: riderLocation }, key: "location",
+                distanceField: "distanceMeters", maxDistance: 5000, spherical: true,
+                query: { createdAt: { $gte: since } } } },
+  { $group: { _id: "$vehicleId", latest: { $top: { sortBy: { createdAt: -1 }, output: {
+      isAvailable: "$isAvailable", distanceMeters: "$distanceMeters", location: "$location", lastSeen: "$createdAt" } } } } },
+  { $match: { "latest.isAvailable": true } },
+  { $sort: { "latest.distanceMeters": 1 } },
+  { $limit: 5 },
+  { $lookup: { from: "VehicleMetadata", localField: "_id", foreignField: "vehicleId", as: "meta",
+               pipeline: [{ $project: { _id: 0, licensePlate: 1, class: 1 } }] } },
+  { $project: { _id: 0, vehicleId: "$_id", licensePlate: { $first: "$meta.licensePlate" },
+                class: { $first: "$meta.class" },
+                distanceKm: { $round: [{ $divide: ["$latest.distanceMeters", 1000] }, 3] },
+                lastSeen: "$latest.lastSeen" } }
 ];
+const r3 = db.TelemetryPings.aggregate(w3).toArray();
+r3.forEach((v, i) => print(`${i + 1}. ${v.licensePlate} (${v.class}) ${v.distanceKm} km  last seen ${v.lastSeen.toISOString()}`));
+if (!r3.length) print("No fresh pings - run: python3 data_generations/mongo_seeder.py --live");
+printExplain("\nWorkflow 3 explain (executionStats):",
+             db.TelemetryPings.explain("executionStats").aggregate(w3));
 
-print("RESULTS");
-print("------------------------------------------------------------");
-
-const workflow3Results =
-  db.TelemetryPings.aggregate(workflow3Pipeline).toArray();
-
-workflow3Results.forEach(function(vehicle, index) {
-  print(
-    (index + 1) +
-    ". " +
-    vehicle.vehicleId +
-    " | " +
-    vehicle.distance_km +
-    " km | available=" +
-    vehicle.isAvailable
-  );
-});
-
-print("");
-
-print("WORKFLOW 3 EXPLAIN");
-print("------------------------------------------------------------");
-
-const workflow3Explain =
-  db.TelemetryPings.explain("executionStats").aggregate(
-    workflow3Pipeline
-  );
-
-const stats3 = workflow3Explain.stages[0].$geoNearCursor.executionStats;
-
-print("Returned             : " + stats3.nReturned);
-print("Execution time       : " + stats3.executionTimeMillis + " ms");
-print("Keys examined        : " + stats3.totalKeysExamined);
-print("Documents examined   : " + stats3.totalDocsExamined);
-
-print("");
-
-
-// ============================================================
-// WORKFLOW 4
-// MULTI-FACETED REVIEW ANALYTICS
-// ============================================================
-
-print("============================================================");
-print("WORKFLOW 4: MULTI-FACETED REVIEW ANALYTICS");
-print("============================================================");
-
-print("Collection: TripReviews");
-print("Documents : " + db.TripReviews.countDocuments());
-print("Operators  : $facet, $unwind, $group, $sort, $avg");
-print("");
-
-const workflow4Pipeline = [
-  {
-    $facet: {
-
-      // 1. Rating distribution
-      rating_distribution: [
-        {
-          $group: {
-            _id: "$rating",
-            count: { $sum: 1 }
-          }
-        },
-        {
-          $sort: {
-            _id: -1
-          }
-        }
-      ],
-
-      // 2. Most frequent feedback tags
-      common_feedback: [
-        {
-          $unwind: "$feedback_tags"
-        },
-        {
-          $group: {
-            _id: "$feedback_tags",
-            total_occurrences: { $sum: 1 }
-          }
-        },
-        {
-          $sort: {
-            total_occurrences: -1
-          }
-        },
-        {
-          $limit: 10
-        }
-      ],
-
-      // 3. Overall average rating
-      overall_average_rating: [
-        {
-          $group: {
-            _id: null,
-            average_rating: { $avg: "$rating" }
-          }
-        },
-        {
-          $project: {
-            _id: 0,
-            average_rating: 1
-          }
-        }
-      ]
-    }
-  }
+// ---------------- WORKFLOW 4 ----------------
+print("\n" + line); print("WORKFLOW 4: MULTI-FACETED REVIEW ANALYTICS ($facet)"); print(line);
+const w4 = [
+  { $facet: {
+      rating_distribution: [ { $group: { _id: "$rating", count: { $sum: 1 } } }, { $sort: { _id: -1 } } ],
+      common_feedback: [ { $unwind: "$feedback_tags" },
+                         { $group: { _id: "$feedback_tags", total_occurrences: { $sum: 1 } } },
+                         { $sort: { total_occurrences: -1, _id: 1 } }, { $limit: 10 } ],
+      overall_average_rating: [ { $group: { _id: null, average_rating: { $avg: "$rating" }, total_reviews: { $sum: 1 } } },
+                                { $project: { _id: 0, average_rating: { $round: ["$average_rating", 3] }, total_reviews: 1 } } ]
+  } }
 ];
-
-const workflow4Results =
-  db.TripReviews.aggregate(workflow4Pipeline).toArray()[0];
-
+const r4 = db.TripReviews.aggregate(w4).toArray()[0];
 print("RATING DISTRIBUTION");
-print("------------------------------------------------------------");
-
-workflow4Results.rating_distribution.forEach(function(item) {
-  print(item._id + " stars : " + item.count);
-});
-
-print("");
-
+r4.rating_distribution.forEach(x => print(`  ${x._id} stars : ${x.count}`));
 print("TOP 10 FEEDBACK TAGS");
-print("------------------------------------------------------------");
-
-workflow4Results.common_feedback.forEach(function(item, index) {
-  print(
-    (index + 1) +
-    ". " +
-    item._id +
-    " : " +
-    item.total_occurrences
-  );
-});
-
-print("");
-
+r4.common_feedback.forEach((x, i) => print(`  ${i + 1}. ${x._id} : ${x.total_occurrences}`));
 print("OVERALL AVERAGE RATING");
-print("------------------------------------------------------------");
+const overall = r4.overall_average_rating[0];
+if (overall) print("  " + overall.average_rating + " over " + overall.total_reviews + " reviews");
+else print("  no reviews yet - run: python3 data_generations/mongo_seeder.py");
+printExplain("\nWorkflow 4 explain (executionStats):",
+             db.TripReviews.explain("executionStats").aggregate(w4));
+print("  note: $facet sub-pipelines cannot use indexes; a full scan of TripReviews is expected");
 
-print(
-  workflow4Results.overall_average_rating[0].average_rating
-);
-
-print("");
-
-
-// ------------------------------------------------------------
-// WORKFLOW 4 EXPLAIN
-// ------------------------------------------------------------
-
-print("WORKFLOW 4 EXPLAIN");
-print("------------------------------------------------------------");
-
-const workflow4Explain =
-  db.TripReviews.explain("executionStats").aggregate(
-    workflow4Pipeline
-  );
-
-const cursorStats =
-  workflow4Explain.stages[0].$cursor.executionStats;
-
-print("Returned             : " + cursorStats.nReturned);
-print("Execution time       : " + cursorStats.executionTimeMillis + " ms");
-print("Keys examined        : " + cursorStats.totalKeysExamined);
-print("Documents examined   : " + cursorStats.totalDocsExamined);
-
-print("");
-
-
-// ============================================================
-// FINAL SUMMARY
-// ============================================================
-
-print("============================================================");
-print("FINAL MONGODB SUMMARY");
-print("============================================================");
-
-print("VehicleMetadata : " +
-      db.VehicleMetadata.countDocuments());
-
-print("TripReviews     : " +
-      db.TripReviews.countDocuments());
-
-print("TelemetryPings  : " +
-      db.TelemetryPings.countDocuments());
-
-print("");
-
-print("Workflow 3 : $geoNear + 2dsphere geospatial index");
-print("Workflow 4 : $facet + $unwind + $group + $sort + $avg");
-
-print("");
-print("============================================================");
-print("                 END OF MONGODB REPORT");
-print("============================================================");
+print("\n" + line); print("                 END OF MONGODB REPORT"); print(line);
